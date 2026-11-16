@@ -1,0 +1,9 @@
+{
+  "_comment": "Model per tier for each agent, used by /deliver. Tiers: fast (mechanical work), standard (yellow work), deep (red work and red reviews). An empty value means: pass no --model and let the agent use its own default. Override on your machine in .agents/models.local.json (git-ignored), same shape, only the keys you change. fallback: optional order of agent or agent:model entries /deliver tries when one hits its usage limit; empty means detected (same agent's other models first, then your agents, then the other installed ones).",
+  "claude": { "fast": "haiku", "standard": "sonnet", "deep": "opus" },
+  "codex": { "fast": "", "standard": "", "deep": "" },
+  "grok": { "fast": "", "standard": "", "deep": "" },
+  "agy": { "fast": "", "standard": "", "deep": "" },
+  "gemini": { "fast": "", "standard": "", "deep": "" },
+  "fallback": []
+}

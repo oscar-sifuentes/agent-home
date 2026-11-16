@@ -1,0 +1,12 @@
+repos.local.yaml
+.env
+.env.*
+*.pem
+.DS_Store
+node_modules/
+.review/
+.agents/models.local.json
+__pycache__/
+.claude/settings.local.json
+.home-local.json
+.cache/

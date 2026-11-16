@@ -1,0 +1,3 @@
+# Per-machine overrides (git-ignored as repos.local.yaml): repo name: local path.
+# bin/home repos fills this in when it finds a repo by its remote URL.
+# api: ~/code/clients/acme/api

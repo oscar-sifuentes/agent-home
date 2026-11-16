@@ -1,0 +1,281 @@
+---
+name: deliver
+argument-hint: '<slug> [agents, e.g. "agy grok" or "red: codex, rest: grok"] [base: <branch>]'
+description: Orchestrate the whole build of an approved spec, from the tickets to a branch ready for the developer's review, across every repo its tickets name (the primary repo plus related ones, found next to this repo). Detects the runner (Orca, Herdr, or sub-agents), asks which agents build the tickets (default the same agent running this skill), creates one worktree per ticket, starts the workers, answers their questions, reviews each finished ticket and merges it into feat/<slug>, then checks the whole branch, runs the local e2e and writes the review packet. Use when the developer runs /deliver <slug> after approving the tickets.
+disable-model-invocation: true
+---
+
+# Deliver
+
+You are the **orchestrator**. Take `<home>/specs/<slug>/` from approved tickets to a reviewed, tested branch. Workers build the tickets; you assign them, answer their questions, review each result and merge it into `feat/<slug>`, the branch everything starts from and returns to. The developer's next touch point is the review packet. Don't wait for them between tickets unless a stop rule below fires.
+
+Running `/deliver` authorizes local commits on `feat/<slug>` and its ticket branches, and creating and removing the ticket worktrees. It never authorizes a push, a PR, a merge to `master` or a deploy.
+
+Three things are separate here, so any agent can orchestrate and any agent can build:
+
+- **Agent:** who writes a ticket's code (`claude`, `codex`, `grok`, `agy`/Antigravity, …).
+- **Runner:** where workers run (Orca, Herdr, your own sub-agents, or you, one at a time).
+- **Contract:** what every worker receives and returns. The same for every agent and runner.
+
+Keep a running log in `.review/feat-<slug>/deliver-log.md`: one line per step, with the result.
+
+## Run unattended
+
+After the one question at the start (section 1), **finish the delivery on your own**. The developer may be away; a question or a permission prompt that nobody answers stalls everything.
+
+- **Decide, log, continue.** Anything in "Decide on your own" below: pick the option you would recommend, write it in the log as `DECISION: <what> because <why>`, list it in the review packet, and keep going. The developer reviews your decisions in the packet, not live.
+- **Ask only for a stop rule** (end of this skill). Those are the cases where a wrong guess can move money, widen access, leak data, add a dependency or migration, or where nothing you can do unblocks the work.
+- **Never trigger a permission prompt you can avoid.** Use `.agents/scripts/worktree.sh` for every worktree and `node_modules` link (never hand-written `rm`/`ln` with shell variables, which safety checks block), `unlink` for symlinks, literal absolute paths, and one command per purpose. Don't pipe into interpreters (`python3 -`, `node -e`) when a plain command or a file edit does the job.
+
+## Quick mode
+
+When the spec says `Kind: quick` (written by the `quick` skill and approved by the developer), run the same machinery with less ceremony. Everything else in this skill applies unless this section says otherwise.
+
+- **No tickets and no question.** Skip section 1's question: one worker, your own agent, on the runner you detect. Model and effort by the page's zone (section 4).
+- **One worker** builds the whole page in one worktree (`worktree.sh add 01`), with the brief below. The page's "How we check it" list is its acceptance criteria; tests only where they add value (a migration or a one-line fix may have none).
+- **Review:** in 🟡 and 🔴, a fresh `risk-review` (section 2b) on the worker's branch, automatically; send blocker or major findings back to the worker, up to the usual limit. In 🟢 skip it. No `code-review` unless the zone is red and the change touches a library API.
+- **Whole branch (section 6):** `verify` only; the ticket review already saw the whole diff.
+- **E2E (section 7):** run the scenario the page names, through the API and, when it touches a UI, the browser with screenshots. If the page says "none", skip. If the local infrastructure is down, start it as section 7 says, and stop it afterwards.
+- **Hand-over (section 8):** a short packet (zone, what changed, checks with their proof, review result, e2e, not verified), the page's checks ticked, "For the wiki" ingested, spec `Status: pr-open`. Then run `open-pr` for a **draft** PR without waiting: `/quick` authorized pushing this branch and opening a draft PR. Label it with its zone. Never merge.
+- **It grew:** if the work needs another repo, a product decision the page doesn't settle, a file in a higher zone than the page says, or turns out much larger than the page, stop and ask the developer whether to go on in quick or switch to the full path (then the page becomes the start of the spec). They decide.
+
+Quick brief: the brief template below, with `ticket <path>` replaced by `the quick spec <home>/specs/<slug>/spec.md` (its "How we check it" list are your acceptance criteria).
+
+## 0. Check the start
+
+**Resume first.** If `feat/<slug>` and `.review/feat-<slug>/deliver-log.md` already exist, a previous run stopped (a usage limit, a crash, a closed terminal) and this run **continues it**; whoever runs `/deliver <slug>` again, with any agent, becomes the orchestrator. Log `RESUME <date> by <agent>`, then:
+- Reuse the integration worktree, the related repos' worktrees and the runner, agents and fallback chain in the log. **Don't ask section 1 again.**
+- Tickets marked `done` stay done. For each ticket `in-progress`: a report file with a `RESULT` line → process it as section 5 says; a worker the runner still shows running → wait for it; otherwise → start it again in its existing worktree with the next entry of the fallback chain and the "continue from the previous worker's work" note.
+- A review with no report file runs again with a fresh reviewer. Servers left running: `servers.sh stop`, then start them again when the e2e needs them.
+- Then continue from the first step the log doesn't show as finished. The checks below that create things (worktrees, branches) are skipped when they already exist.
+
+
+- `<home>/specs/<slug>/spec.md` exists with status `approved` (or `building` when resuming), and `tickets/` has at least one `ready` ticket (a `Kind: quick` spec has no tickets: see Quick mode). If not, stop and say which step is missing (`/to-spec`, `/to-tickets`).
+- The working tree is clean.
+- The **base** is the branch the developer names; **with no answer, the branch you are on now** (`git branch --show-current`). If you are on `master` or a deploy branch, use `origin/master` (fetch first) instead of the local branch.
+- **Where you run.** Usually from the home repo (`<home>`), where the spec lives. The **primary repo** is the first entry of the spec's `Repos:` line (the only repo in repos.yaml when there is one; otherwise ask); the others are related repos (below). If you run inside a code repo instead, that repo is the primary one.
+- Create (or reuse) the primary repo's integration branch and worktree, with dependencies installed once:
+  - from the home repo: `bash <home>/.agents/scripts/worktree.sh --repo "$(<home>/bin/home where <primary repo>)" integration <slug> <base>`;
+  - from inside the primary repo: `bash .agents/scripts/worktree.sh integration <slug> <base>`.
+  It prints the integration worktree path; **work from there for the rest of the delivery** (log, briefs, merges). Never work on `master`.
+- Every worktree `worktree.sh` creates in a connected repo (one with `.agents/home.sh`) gets the shared skills, scripts and sub-agents as local links, and Claude Code may read `<home>` there without a prompt. A repo that isn't connected still works: the brief gives every path in `<home>` absolutely. List unconnected repos in the hand-over (`<home>/bin/home connect <repo> --pr` fixes them).
+- **The base** of a repo you reach from the home repo is its fresh default branch (`origin/<default>`), unless the developer named one.
+- **Related repos.** Read the `Repo:` line of every ticket (none means this repo). A ticket without the line that clearly belongs to another repo (its title or notes name a front, the back office, or files that aren't here) takes that repo: log it as a DECISION. For each other repo:
+  1. Find it: `bash .agents/scripts/worktree.sh repo <name>` (a sibling folder whose name or `origin` is `<name>`). If it isn't found, that is the one thing to ask in section 1 (offer to clone it with `<home>/bin/home clone <name>`, and clone only on a yes); with no answer, skip that repo's tickets and say so in the hand-over.
+  2. Its base is its default branch, fresh: `git -C <repo> fetch origin`, then `origin/<default>` (`git -C <repo> symbolic-ref --short refs/remotes/origin/HEAD`). Never the branch the developer has checked out there, and never touch that checkout.
+  3. Create its integration worktree: `bash .agents/scripts/worktree.sh --repo <repo path> integration <slug> origin/<default>`. It prints `<repo parent>/<repo>--<slug>` on `feat/<slug>`, installs with the repo's own package manager and links its untracked `.env*` files from the main checkout, so a server can start there.
+  4. Log `REPO <name>: <repo path> → <integration worktree>`.
+  A related repo doesn't need `.agents/` or `AGENTS.md`: its workers read the skills from the home repo by absolute path (`<home>/.agents/skills/`).
+
+- Set the spec's status to `building` and publish it: `<home>/bin/home save "spec: <slug> building"`.
+
+## 1. Detect the runner, ask for the agents
+
+**Runner.** Default: where you are running.
+
+| You are in | Detected by | Default runner |
+|---|---|---|
+| Orca (a terminal or the chat view) | `orca` is on the PATH and `ORCA_TERMINAL_HANDLE` or `ORCA_AGENT_SESSION_ID` is set (the chat view sets only the second) | Orca: each worker gets its own visible terminal in its worktree |
+| Herdr | `HC_TERMINAL_ID` is set and `hc` is on the PATH | Herdr (`hc`) |
+| Neither | | your own sub-agents if your tool has them, otherwise one at a time |
+
+A Herdr runner needs you inside a Herdr terminal (`HC_TERMINAL_ID`), so workers can report to you. Don't mix runners in one delivery.
+
+**Agents.** If the developer already gave the agents (and optionally the base or runner) in the command arguments (`/deliver <slug> agy grok`, `/deliver <slug> base: main, red: codex, rest: grok`) or said them right before running it, use that and **don't ask**: show the assignment and start. Otherwise ask once, showing the detected runner:
+
+> Base: **<current branch>**. Runner: **<detected>**. Which agents should build the N tickets? Press enter for **<your own agent>** (the agent running this orchestrator) and this base.
+> Options: `<your own agent>`, `claude`, `codex`, `grok`, `agy`, or a mix such as `red: codex, rest: grok,agy` (round-robin within each group). Add a model with `agent:model` (otherwise the tiers in `.agents/models.json` decide). You can also change the base or the runner.
+
+- **Which agents are installed** is detected, not asked: `command -v claude codex gemini grok agy cursor-agent copilot`. Offer only those in the question.
+- **No answer: every worker is your own agent.** Nothing defaults to a particular vendor.
+- **Fallback chain**, for when an agent hits its usage limit (section 5). Build it once and write it in the log:
+  1. **other models of the same agent first** (some agents have a separate quota per model; Antigravity's is per model, every 5 hours): the models `.agents/models.json` (or `.agents/models.local.json`) lists for it, strongest first, or, when the agent lists its models itself (`agy models`), those, keeping the same family before switching to another (for example Antigravity's Gemini models, then its Claude models);
+  2. then the developer's agents, in their order;
+  3. then the other **installed** agents, then your own.
+  `fallback` in `.agents/models.json` (or `.agents/models.local.json`) (a list such as `["agy:<model>", "agy:<model>", "claude", "codex"]`) replaces this order when it is set; each developer can set it in the local override.
+- Sub-agents can only be your own agent. If the developer picks another agent and the runner is sub-agents or none, use your own agent and log it as a decision.
+- Write the assignment (ticket → agent) and the runner in the log, show it, and start right away; this is the only question of the run.
+- **Fold into that same question, only when they apply:** a related repo that wasn't found (its path), and, when a ticket adds a migration, "may I run it on the **local Docker** database for the e2e?" (no answer: no; the e2e of what needs it stays pending).
+
+Merges, the decision on every review finding, the e2e and the review packet stay with you, whatever agents build the tickets. **The reviews themselves never run in your context**: fresh reviewers do them (section 2b).
+
+## 2. The worker contract
+
+For each ticket you start:
+
+1. **Worktree.** From the integration worktree **of the ticket's repo**, for every runner: `bash <this repo's integration worktree>/.agents/scripts/worktree.sh add NN` (for this repo, `bash .agents/scripts/worktree.sh add NN` as before). It creates `feat/<slug>--NN` from the tip of `feat/<slug>` in `<integration worktree>--NN`, links `node_modules` from the integration worktree, prints the path, and reuses the worktree when you retry the same ticket. A ticket that changes `package.json` or `yarn.lock` replaces the link with its own install, through `heavy.sh`.
+2. **Brief.** Write `.review/feat-<slug>/workers/NN-brief.md` from the template below, then pass its absolute path (or its text, when the runner needs it inline).
+3. **Report file.** The worker writes `<worktree>/.review/worker-report.md` (inside its own worktree, so sandboxed agents can write it; `.review/` is git-ignored) ending in `RESULT: done | failed | question`. **That file is the source of truth**; the runner's signal only wakes you.
+
+### Brief template
+
+```text
+You are the worker for ticket <home>/specs/<slug>/tickets/NN-<title>.md.
+Read AGENTS.md, then follow .agents/skills/implement-ticket/SKILL.md exactly.
+Spec: <home>/specs/<slug>/spec.md. Integration branch: feat/<slug>. Your branch: feat/<slug>--NN.
+Your worktree (stay in it): <absolute worktree path>.
+Report file: <absolute worktree path>/.review/worker-report.md.
+Runner: <Orca | Herdr | sub-agent>. Orchestrator: <Herdr: your HC_TERMINAL_ID; Orca: your coordinator, Orca routes it>.
+Repo: <primary | related repo name>. Skills: <home>/.agents/skills/ (read implement-ticket/SKILL.md from there when your repo has no .agents/skills). Spec and tickets: <home>/specs/<slug>/.
+Team wiki (read-only for you): <home>/wiki/index.md. Run tests, tsc and Docker through <home>/.agents/scripts/heavy.sh. Never push, open a PR, merge into feat/<slug>, start other agents or touch another ticket.
+Ask before guessing on money, auth, access or data exposure. When done, write the report file and signal as the skill says.
+```
+
+## 2b. Reviewers
+
+A review is only worth something if the reviewer didn't build the code and isn't invested in finishing the delivery. So:
+
+- **Never the builder, never you.** Every `risk-review` and `code-review` runs in a **new agent with a clean context**, started through the runner like a worker (Orca `worker-start`, Herdr `hc run`, or a sub-agent; in Claude Code, the `risk-reviewer` agent for risk). With no runner and no sub-agents, start one with the non-interactive mode of an installed agent CLI (`claude -p`, `codex exec`, `gemini -p`, `grok -p`, `agy -p`) in the worktree under review. Only when none of these exists, review yourself in a separate pass that reads only the reviewer inputs below, and log `REVIEW: no fresh reviewer available`.
+- **Same agent, stronger, for red work.** Don't switch agents just to review. The reviewer is the agent that built the ticket (for the whole branch, your own agent), in a new session, one step stronger than the builder: the next model tier, or, if the builder was already at the deep tier, one more effort level (never above `xhigh`). Yellow and green: the same agent, fresh, at the tier of section 4. If the reviewer hits its usage limit or can't go on, the same rule as for a worker applies (section 5, "The agent can't go on"): start a fresh reviewer with the next entry of the fallback chain, from the same inputs.
+- **Inputs only:** the diff (`<base>` and the branch), the spec, the ticket, `AGENTS.md` (and the related repo's own rules). **Not the worker's report**, so the reviewer doesn't anchor on "already tested"; you compare the two afterwards.
+- **Read-only.** The reviewer edits nothing and runs no heavy command. It works in the worktree under review: the ticket worktree for a ticket, the integration worktree for the whole branch.
+- **Report file:** `<that worktree>/.review/review-<risk|code>.md`, ending in `RESULT: pass | findings | failed`. Copy it to `.review/feat-<slug>/reviews/<NN|branch>-<risk|code>.md` before the worktree goes away.
+- **In parallel.** `risk-review` and `code-review` of the same target start together; they only read. They don't count toward the worker limit, but run at most two reviewers at once.
+- **You decide.** Read both reports. Merge duplicate findings (same `file:line`, same problem) into one. Check that each `blocker` or `major` names a real `file:line` and a concrete scenario; drop what doesn't hold and log why. Send what holds to a worker, and record every `minor` in the packet.
+
+Reviewer brief:
+
+```text
+You are a reviewer for /deliver. You did not build this code.
+Run the <risk-review | code-review> skill (.agents/skills/<skill>/SKILL.md; absolute path: <path>) on <worktree>, base <base ref>, branch <branch>.
+Zone: <zone>. Spec: <path>. Ticket: <path or "whole branch">. Rules: AGENTS.md<, and <related repo>'s own AGENTS.md or README>.
+Read-only: edit nothing, run no tests or builds, don't read .review/worker-report.md.
+Write your findings to <worktree>/.review/review-<risk|code>.md, ending with RESULT: pass | findings | failed, then signal as a worker does.
+```
+
+## 3. Runner commands
+
+| Step | Orca | Herdr (`hc`) | Your sub-agents |
+|---|---|---|---|
+| Setup | `orca orchestration run-create --objective "deliver <slug>"`; one `task-create --spec-file <brief> --task-title "<slug> NN" --deps '[<blocker task ids>]'` per ticket | none | none |
+| Start | `orca orchestration worker-start --task <id> --worktree path:<worktree> --agent <agent> [--model <m>] [--effort <e>] --json`. On an existing worktree Orca rejects `--setup`, `--name` and `--display-name`; put the label in `task-create --display-name` instead. Antigravity's Orca id is `antigravity` | `hc run --bg --name <slug>-NN --cwd <worktree> <agent command> "<brief text>"` | spawn one per ticket in its worktree (Claude Code: the `ticket-implementer` agent) |
+| Wait | `orca orchestration check --wait --types worker_done,question,escalation --timeout-ms 600000 --json` | `hc wait --children any` (a timeout is a check-in: wait again) | the tool returns the result |
+| Read | the report file; `orca orchestration worker-read --dispatch <id>` for context | the report file; `hc read --lines 100 <slug>-NN` for context | the report file |
+| Answer / send fixes | `orca orchestration reply --id <msg>`; `orca orchestration send --to dispatch:<id> --type dispatch --subject ... --body ...` | `hc send <slug>-NN "<answer or findings>"` | the tool's message to the sub-agent (Claude Code: SendMessage) |
+| Retry | `worker-start --task <id> --retry-of <dispatch_id> --worktree path:<same worktree> --agent <agent>`; it resends the original brief, so send the "continue from the previous worker's work" note right after as `send --to dispatch:<new id> --type dispatch` | kill the old terminal, `hc run` again in the same worktree with the brief plus that note | spawn again with the brief plus that note |
+| Stop / clean up | `orca orchestration worker-stop --dispatch <id>` (still running) or `worker-release --dispatch <id>` (finished), then `bash .agents/scripts/worktree.sh remove NN` | `hc kill <slug>-NN; hc rm <slug>-NN`, then `worktree.sh remove NN` | `worktree.sh remove NN` |
+| Wait in the background | run the Wait command as a background task when your tool has them, so you can review one worker while the others build | | |
+
+Agent commands for Herdr: `claude --add-dir <home>`, `agy --add-dir <home>` (so they read the shared skills, spec and wiki without a permission prompt; under Orca, `home.sh link` already allowed it), `grok` (reads outside its worktree by default; it rejects `--add-dir`: "a session works only in its cwd"), `codex --no-daemon` (required, or its commands run outside hc; its default sandbox already reads anywhere), plus `--model`/`-m` as each CLI takes it. If an agent doesn't take the first task as an argument, start it without one, `hc wait` until it is ready, then `hc send` the brief. Check `first_message.sent` in the launch result; if false, `hc read` before resending.
+
+Don't trust an agent's idle status or screen text as "finished": finished means a report file with a `RESULT` line and, for `done`, a commit on its branch.
+
+## 4. Effort and model
+
+Set the reasoning effort **and** the model tier of every worker and reviewer you start; don't leave them to the agent's defaults. Your own model and effort can't change mid-session; you only choose for what you delegate, and that can be cheaper or stronger than you.
+
+**Base, by role and the ticket's zone** (effort / model tier):
+
+| Role | 🟢 Green | 🟡 Yellow | 🔴 Red |
+|---|---|---|---|
+| Worker (`implement-ticket`) | low / fast | medium / standard | high / deep |
+| `risk-review` | low / fast | medium / standard | xhigh / deep |
+| `code-review`, Standards and Spec axes | low / fast | medium / standard | high / deep |
+| `code-review`, Docs axis | low / fast | low / fast | medium / standard |
+| `e2e`, `review-packet` | low / fast | medium / standard | medium / standard |
+
+Mechanical work (README, CHANGELOG, pure moves, renames) is low / fast whatever the zone. For checks on the whole branch, use the branch's highest zone.
+
+**Tier → model** comes from `.agents/models.json`, overridden key by key by `.agents/models.local.json` when it exists. An empty value means: pass no model and let the agent use its default. If the developer gave a model in the agent list (`codex:<model>`), it wins for that agent's workers.
+
+**Your own session.** At the start, recommend once, and carry on with whatever the developer decides:
+- red spec and your effort below high: "I recommend `/effort high` for the orchestrator."
+- you run on the deep tier: "Orchestrating is mostly coordination; the standard tier is enough for me (`/model <standard model>`). Red reviews still go to the deep tier."
+
+**Escalate** the next attempt on the same ticket, one step at a time, in this order:
+1. **effort +1** (low → medium → high → xhigh), when `verify` fails twice in a row on the same thing, a `blocker` or `major` finding survives the first fix round, or a worker reports `RESULT: failed` or is stuck
+2. **model tier +1** (fast → standard → deep), same agent, when the effort step didn't help
+3. **another agent** from the developer's list, in the same worktree
+Merge conflicts you couldn't resolve go to a worker at least at high / deep.
+
+**Limits:** effort never above `xhigh` on your own (`max` only when the developer asks) and at most two levels above the base; model never above deep. When the ladder is used up, it is a stop rule. Write every change in the log (`03: high/standard → xhigh/standard, verify failed twice`) and list them in the review packet.
+
+**How to pass them:**
+
+| Agent / runner | Effort | Model |
+|---|---|---|
+| Claude Code sub-agent | the `effort` of the agent call | the `model` of the agent call (`haiku`, `sonnet`, `opus`) |
+| `claude` CLI (Herdr) | `--effort <level>` (low … max) | `--model <model>` |
+| `codex` CLI (Herdr) | `-c model_reasoning_effort=<level>` (minimal … xhigh) | `-m <model>` |
+| `grok` CLI (Herdr) | `--reasoning-effort <level>` | `-m <model>` |
+| `agy` CLI (Herdr) | `--effort <level>` (low … max) | `--model <model>` |
+| Orca | `worker-start --effort <level>` | `worker-start --model <id>`; Orca takes `--effort` only with `--model`, so with no mapped model, start without either |
+
+If an agent rejects a level or a model, use the nearest one it accepts, or none (Orca rejects every `--effort` for Claude `haiku`), and log it. Never stop for this.
+
+## 5. Build the tickets
+
+Work the **frontier**: the tickets whose blockers are all `done`, whatever their repo. Tickets in different repos never conflict, so they can build at the same time within the limits below.
+
+- **Red tickets run one at a time.** Yellow and green tickets run at most three workers at once, so the machine stays usable.
+- Heavy commands (tests, tsc, Docker) go through `.agents/scripts/heavy.sh`, so parallel workers never run two at once.
+
+When a worker signals, read its report file:
+
+- **`RESULT: question`**: answer it yourself from the spec, the code and `AGENTS.md`, choosing what you would recommend, and log it as a decision. Only a question on money, auth, access or data exposure that the spec doesn't answer is a stop rule.
+- **`RESULT: failed`**: send what to fix, or retry (below).
+- **The agent can't go on** (usage or rate limit, login expired, crashed, stuck on a prompt only a person can answer such as an upgrade, payment or login screen): don't answer that screen and don't ask the developer. Stop that worker and **retry the ticket with the next entry of the fallback chain** (section 1): first another model of the same agent, then another agent, in the same worktree, with the "continue from the previous worker's work" note. Log it.
+- **`RESULT: done`**:
+  1. Check: the commit in the report is the tip of `feat/<slug>--NN`, the worker touched only its worktree, and nothing was pushed (`git ls-remote origin feat/<slug>--NN` is empty).
+  2. Start the reviewers (section 2b) on the ticket worktree, base `feat/<slug>` **of its repo**: `risk-review`, and for a red ticket `code-review` at the same time. In another repo, its conventions come from that repo's `AGENTS.md` or README, the money and security rules from this one. Wait for both reports and decide on the findings.
+  3. On a `blocker` or `major` finding, send the findings to the same worker. Escalate as section 4 says: effort, then model tier, then **another agent from the developer's list in the same worktree**, so it continues from the existing work. After that, stop and ask.
+  4. **Merge the ticket branch into `feat/<slug>` of its repo** (in that repo's integration worktree) with `--no-ff`. You do every merge, one at a time, and **resolve conflicts yourself**: the tickets come from the same spec, so keep both sides' intent (for example, both CHANGELOG bullets). Only a conflict inside red-zone logic whose right result you can't tell goes back to the worker that built the ticket, at least high / deep. Mark the ticket `done`.
+  5. Copy its report to `.review/feat-<slug>/workers/NN-report.md` (keep its "For the wiki" list for the hand-over), clean up the worker and its worktree (runner table), and start the tickets this merge unblocked.
+
+## 6. Check the whole branch
+
+On `feat/<slug>` against the base (so only this delivery's changes are reviewed), **in every repo of the delivery**. In a related repo without `.agents/`, "verify" means its own lint, typecheck and tests on the changed files, from its `package.json`, through this repo's `heavy.sh`:
+
+0. **Only when a `simplify` skill is available to you:** check your own list of skills or slash commands for `simplify` (Claude Code bundles it, unless `disableBundledSkills` is on). If it isn't there (another agent, an older version, bundled skills off), skip this step without asking or installing anything, and log `simplify: not available`. If it is, run it on the delivery's diff against the base. Workers on different agents repeat helpers and drift in style; this cleans that up before anyone reviews it. It edits code, so:
+   - keep only cleanups that don't change behaviour; revert any edit to a test that proves a spec invariant, and any change to an amount, a guard, a transaction or an idempotency key;
+   - commit what's left on its own (`refactor(<area>): simplify <slug>`), so the reviewer can tell it apart from the tickets;
+   - log it as a `DECISION` with a one-line summary.
+   When it's skipped, the Standards axis of `code-review` covers part of it.
+1. the `verify` skill
+2. then, in parallel, fresh reviewers (section 2b) on the integration worktree against the base: `risk-review` on the whole diff, and `code-review` when any ticket is red. A ticket's reviewer already saw its diff alone; these look for what only shows across tickets (two tickets touching one flow, a helper repeated, an invariant split between them).
+
+Fix through a worker (the agent that built that ticket, or another): create a fix worktree with `worktree.sh add NNb` and brief exactly what to change. The same limit of 2 rounds applies. When the fix is small and the zone is green, the whole-branch `verify` after the merge is its review.
+
+Then **consolidate the open questions**: copy every open question from the worker reports into the spec's "Open questions" section (one line each, with the file and behaviour), and commit it on `feat/<slug>`.
+
+## 7. E2E, locally
+
+Skip this step only when the spec's "E2E scenarios" section says it is not applicable (no runtime behaviour changes); say so in the log and the packet.
+
+The e2e must run **the delivery's code**, so start the servers yourself from the integration worktrees, without asking:
+
+1. Run the `dev-env` skill for the **infrastructure** (Postgres, Redis, RabbitMQ in the `local-dev` Docker stack). If it is down, it starts it from the runbook (`<home>/wiki/runbooks/local-environment.md`) and records it in `.review/feat-<slug>/started-by-agent.txt`; if it can't, the e2e is pending and the delivery goes on.
+2. Start each app the scenarios need with `.agents/scripts/servers.sh`, from its integration worktree, on a free port (`servers.sh free-port 5101`, `free-port 3101`), as "Run from a worktree" in `AGENTS.md` says. Point each front at the API you started, not at the developer's. A related repo not listed there: derive the command from its `package.json` (`dev` script) and its README, log it as a DECISION, and propose the line for `AGENTS.md` in the hand-over.
+3. A migration of this delivery runs on the local Docker database only if the developer said yes in section 1; otherwise the scenarios that need it are pending. Never a Docker build, never a shared or remote database.
+4. Run the `e2e` skill against those URLs. A failing scenario goes back to a worker for the ticket it belongs to; restart that server, then run the e2e again.
+5. When the e2e is done, even when it failed: `bash .agents/scripts/servers.sh stop`, then stop what `started-by-agent.txt` lists (the Docker services you started). Leave running what was already running.
+
+## 8. Hand over
+
+0. **Feed the wiki.** Collect the "For the wiki" items of every worker report, plus what you learned yourself (decisions in the log that the team will need again, root causes, gotchas), and run `wiki-ingest` once in `<home>`. Workers never write to `<home>`; you do, once.
+1. Run the `review-packet` skill: **one packet for the whole delivery**, with a section per repo (branch, files, zone). List the runner, which agent and model built each ticket, every effort or model change, and every `DECISION` from the log.
+2. Make sure no worker or server is left running (`servers.sh status`) and no ticket worktree is left over (`git worktree list`, and `git -C <repo> worktree list` for each related repo). Keep the integration worktree: the developer reviews there, and `/open-pr` closes it once the PR is open.
+3. Tell the developer it is ready for their review: the branch in each repo with its integration worktree path, the review page (`.review/<branch>/review.html`) and the packet path, and one line each for the zone, the tests, the e2e result, the decisions you made and any open question. Send a push notification if the tool has one.
+
+## Decide on your own (log it as a DECISION)
+
+- which agent or model continues a ticket or a review when one can't go on (the next entry of the fallback chain)
+- effort and model changes, and dropping a level an agent rejects
+- answers to worker questions the spec, the code or `AGENTS.md` answer, including test conventions and tooling choices inside the spec's zone that add no dependency
+- merge conflicts between tickets of this delivery
+- fixing review findings through a worker, up to the limits
+- which agent reviews (section 2b), and dropping a finding that doesn't hold, with the reason
+- a minor finding: fix it if cheap, otherwise record it in the packet
+- skipping a step the spec marks as not applicable
+
+## Stop and ask the developer only when
+
+- in quick mode, the work outgrew its page (see Quick mode)
+
+- the spec doesn't answer a question on money, auth, access or data exposure
+- a ticket needs a new dependency, a migration not in the spec, or a change outside the spec
+- a worker pushed, touched another ticket's files, or worked outside its worktree
+- every agent in the list, and your own, failed the same ticket (the escalation ladder is used up)
+- a test can't pass without changing what the spec says
+
+Batch what you can: finish all the work the question doesn't block first, then ask once, with your recommended answer, and wait. Everything else goes in the hand-over message and the packet.

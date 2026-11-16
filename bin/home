@@ -1,0 +1,1096 @@
+#!/usr/bin/env python3
+"""Home repo CLI (agent-home kit). Standard library only, so it runs on any Mac, Linux box and CI.
+Settings live in home.yaml (name, host: github | gitlab | bitbucket | none, owners, deploy branches).
+
+  home init <name> [--host H] [--owner O]...  set this home repo up (install.sh new runs it)
+  home connect <path>      connect a local checkout: writes .agents/home.sh, an AGENTS.md section and a
+                           session hook into it and adds it to repos.yaml; you review and commit
+  home connect <repo> [--pr]  same on branch chore/connect-<name> in a worktree; --pr opens a PR/MR
+  home repos [--brief] [--scan]  which repos are on this machine, where, on which branch
+  home where <repo>        local path of a repo (exit 1 if not cloned)
+  home clone <repo>        clone it next to the others; agents run it only after the developer confirms
+  home discover            add repos created by the owners in home.yaml since the last run
+  home prs [repo]          open pull/merge requests (host adapter)
+  home pr <repo> <base> <head> <title> <body-file> [labels...]  open a draft PR/MR on any host
+  home now                 regenerate wiki/now.md: active specs, open PRs, recent merges
+  home branches [days]     regenerate wiki/branches.md from git: deploy and active branches
+  home pending [--brief|--done]  merged work not yet ingested into the wiki
+  home sync [--quiet]      pull this repo and push commits left from an earlier session
+  home setup               let Claude Code here work in the repos folder without prompts
+  home index | pointers | check | log <type> <title>
+  home save "<message>"    index + commit + rebase on main + push; regenerated files resolve on
+                           their own; a real conflict stops with the files to merge
+  home save --continue     after merging those files, finish the save
+"""
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+WIKI = ROOT / "wiki"
+SPECS = ROOT / "specs"
+GENERATED = {"index.md", "now.md", "log.md", "branches.md"}
+STATE = ROOT / "ingest-state.json"
+# Agents obey these paths, so changes to them always go through a reviewed PR.
+PROTECTED = ("AGENTS.md", "CLAUDE.md", ".agents/", ".claude/", "bin/", "templates/", "wiki/rules/", ".github/")
+# Set to True to send changes to PROTECTED paths through a PR instead of straight to main.
+PROTECTED_VIA_PR = False
+CONNECT = ROOT / "templates" / "connect"
+REQUIRED = ("title", "type", "summary")
+TYPES = {"project", "repo", "decision", "incident", "runbook", "provider", "rule", "roadmap", "concept", "research"}
+FOLDER_TITLES = {
+    "projects": "Projects", "repos": "Repos", "decisions": "Decisions", "incidents": "Incidents",
+    "runbooks": "Runbooks", "providers": "Providers", "rules": "Rules", "roadmap": "Roadmap",
+    "concepts": "Concepts", "research": "Research",
+}
+
+
+# ---------- tiny parsers (flat YAML subset) ----------
+
+def parse_value(raw):
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        return [v.strip().strip("'\"") for v in raw[1:-1].split(",") if v.strip()]
+    return raw.strip("'\"")
+
+
+def parse_frontmatter(text):
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}, text
+    meta = {}
+    for line in text[4:end].splitlines():
+        m = re.match(r"^([A-Za-z_]+):\s*(.*)$", line)
+        if m:
+            meta[m.group(1)] = parse_value(m.group(2))
+    return meta, text[end + 4:]
+
+
+def spec_meta(text):
+    """Spec metadata: frontmatter, or the '- **Status:** x' bullets /to-spec writes."""
+    meta, body = parse_frontmatter(text)
+    for key in ("Status", "Owner", "Repos", "Zone"):
+        m = re.search(rf"^- \*\*{key}:\*\*\s*(.+)$", body, re.M)
+        if m and key.lower() not in meta:
+            meta[key.lower()] = m.group(1).strip()
+    m = re.search(r"^# (.+)$", body, re.M)
+    if m and "title" not in meta:
+        meta["title"] = m.group(1).strip()
+    return meta
+
+
+def load_repos():
+    repos, cur = [], None
+    for line in (ROOT / "repos.yaml").read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^- name:\s*(.+)$", line)
+        if m:
+            cur = {"name": m.group(1).strip()}
+            repos.append(cur)
+            continue
+        m = re.match(r"^\s+([a-z_]+):\s*(.*)$", line)
+        if m and cur is not None:
+            cur[m.group(1)] = parse_value(m.group(2))
+    return repos
+
+
+def local_overrides():
+    path = ROOT / "repos.local.yaml"
+    out = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            m = re.match(r"^([A-Za-z0-9_.-]+):\s*(.+)$", line.strip())
+            if m and not line.lstrip().startswith("#"):
+                out[m.group(1)] = os.path.expanduser(m.group(2).split(" #")[0].strip())
+    return out
+
+
+
+# ---------- config ----------
+
+CONFIG_FILE = ROOT / "home.yaml"
+
+
+def load_config():
+    cfg = {"name": ROOT.name, "host": "github", "owners": [], "deploy_branches": ["main", "master", "production", "staging"]}
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            m = re.match(r"^([a-z_]+):\s*(.*?)\s*(#.*)?$", line)
+            if m and not line.lstrip().startswith("#"):
+                cfg[m.group(1)] = parse_value(m.group(2))
+    for key in ("owners", "deploy_branches"):
+        if isinstance(cfg[key], str):
+            cfg[key] = [cfg[key]] if cfg[key] else []
+    return cfg
+
+
+CFG = load_config()
+NAME = CFG["name"]
+HOST = CFG["host"]
+DEPLOY_BRANCHES = tuple(CFG["deploy_branches"])
+CACHE = ROOT / ".cache"   # bare, blob-less mirrors of repos not cloned here (git-ignored)
+
+
+def repos_root():
+    return Path(os.environ.get("HOME_REPOS_ROOT", ROOT.parent)).expanduser()
+
+
+def repo_slug(url):
+    """host/owner/name of any git URL (https or ssh), lower case."""
+    url = url.strip()
+    m = re.match(r"^(?:[a-z+]+://)?(?:[^@/]+@)?([^/:]+)[:/]+(.+?)(?:\.git)?/?$", url)
+    return f"{m.group(1)}/{m.group(2)}".lower() if m else None
+
+
+def run_json(cmd):
+    try:
+        res = subprocess.run(cmd, text=True, capture_output=True)
+    except FileNotFoundError:
+        return None, f"{cmd[0]} is not installed"
+    if res.returncode != 0:
+        return None, (res.stderr.strip() or "error").splitlines()[0]
+    try:
+        return json.loads(res.stdout or "[]"), None
+    except json.JSONDecodeError:
+        return None, "unexpected output"
+
+
+def gh_json(args):
+    return run_json(["gh", *args])
+
+
+def gl_path(r):
+    """GitLab project path for the API: the URL path, URL-encoded."""
+    slug = repo_slug(r["url"]) or f"x/{r['org']}/{r['name']}"
+    return slug.split("/", 1)[1].replace("/", "%2F")
+
+
+def gl_api(path):
+    return run_json(["glab", "api", "--paginate", path])
+
+
+# ---------- host adapter ----------
+# Each function returns (rows, error). error means "this host can't answer here": callers fall
+# back to plain git (merged work from the default branch's history) or skip the section.
+
+def host_open_prs(r):
+    if HOST == "github":
+        rows, err = gh_json(["pr", "list", "--repo", f"{r['org']}/{r['name']}", "--state", "open", "--limit", "50",
+                             "--json", "number,title,author,headRefName,updatedAt,isDraft,url"])
+        return ([{"number": p["number"], "title": p["title"], "author": p["author"]["login"], "branch": p["headRefName"],
+                  "updated": p["updatedAt"], "draft": p["isDraft"], "url": p["url"]} for p in rows] if rows is not None else None), err
+    if HOST == "gitlab":
+        rows, err = gl_api(f"projects/{gl_path(r)}/merge_requests?state=opened&per_page=50")
+        return ([{"number": p["iid"], "title": p["title"], "author": p["author"]["username"], "branch": p["source_branch"],
+                  "updated": p["updated_at"], "draft": p.get("draft", False), "url": p["web_url"]} for p in rows] if rows is not None else None), err
+    return None, f"{HOST}: open pull requests need a host adapter"
+
+
+def host_merged_prs(r, since):
+    if HOST == "github":
+        rows, err = gh_json(["pr", "list", "--repo", f"{r['org']}/{r['name']}", "--state", "merged", "--limit", "100",
+                             "--search", f"merged:>={since[:10]}", "--json", "number,title,author,mergedAt,baseRefName,url"])
+        return ([{"number": p["number"], "title": p["title"], "author": p["author"]["login"], "merged": p["mergedAt"],
+                  "base": p["baseRefName"], "url": p["url"]} for p in rows if p["mergedAt"] >= since] if rows is not None else None), err
+    if HOST == "gitlab":
+        rows, err = gl_api(f"projects/{gl_path(r)}/merge_requests?state=merged&updated_after={since}&per_page=100")
+        return ([{"number": p["iid"], "title": p["title"], "author": p["author"]["username"], "merged": p.get("merged_at") or p["updated_at"],
+                  "base": p["target_branch"], "url": p["web_url"]} for p in rows if (p.get("merged_at") or "") >= since] if rows is not None else None), err
+    return None, f"{HOST}: merged pull requests come from git history"
+
+
+def host_list_repos(owner):
+    if HOST == "github":
+        rows, err = gh_json(["repo", "list", owner, "--limit", "500", "--json",
+                             "name,createdAt,isArchived,description,primaryLanguage,defaultBranchRef,url"])
+        return ([{"name": x["name"], "created": x["createdAt"], "archived": x["isArchived"], "description": x.get("description") or "",
+                  "language": (x.get("primaryLanguage") or {}).get("name") or "unknown",
+                  "default_branch": (x.get("defaultBranchRef") or {}).get("name") or "main", "url": x["url"] + ".git"}
+                 for x in rows] if rows is not None else None), err
+    if HOST == "gitlab":
+        rows, err = gl_api(f"groups/{owner.replace('/', '%2F')}/projects?include_subgroups=true&per_page=100")
+        if rows is None:
+            rows, err = gl_api(f"users/{owner}/projects?per_page=100")
+        return ([{"name": x["path"], "created": x["created_at"], "archived": x.get("archived", False),
+                  "description": x.get("description") or "", "language": "unknown",
+                  "default_branch": x.get("default_branch") or "main", "url": x["http_url_to_repo"]}
+                 for x in rows] if rows is not None else None), err
+    return None, f"{HOST}: listing new repos needs a host adapter; add them to repos.yaml by hand"
+
+
+def host_create_pr(r, cwd, base, head, title, body_file, labels=()):
+    if HOST == "github":
+        cmd = ["gh", "pr", "create", "--repo", f"{r['org']}/{r['name']}", "--base", base, "--head", head,
+               "--title", title, "--body-file", str(body_file), "--draft"]
+        for l in labels:
+            cmd += ["--label", l]
+    elif HOST == "gitlab":
+        cmd = ["glab", "mr", "create", "--source-branch", head, "--target-branch", base, "--title", title,
+               "--description", Path(body_file).read_text(), "--draft", "--yes"]
+        if labels:
+            cmd += ["--label", ",".join(labels)]
+    else:
+        slug = repo_slug(r["url"]) or ""
+        web = "https://" + slug
+        if HOST == "bitbucket":
+            return f"open it here: {web}/pull-requests/new?source={head}&dest={base}", None
+        return f"pushed {head}; open a pull request from it to {base} in {web}", None
+    res = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+    if res.returncode != 0 and labels:
+        # a missing label must not block the PR
+        res = subprocess.run([c for c in cmd if c not in labels and c not in ("--label", ",".join(labels))],
+                             cwd=cwd, text=True, capture_output=True)
+    return (res.stdout.strip() or res.stderr.strip()), (None if res.returncode == 0 else "pr create failed")
+
+
+# ---------- git access to any repo (local clone, or a blob-less mirror in .cache/) ----------
+
+def git_dir_for(r, fetch=True):
+    path = local_path(r["name"])
+    if path:
+        if fetch:
+            git("fetch", "--quiet", "--prune", "origin", check=False, cwd=path)
+        return path, "origin/"
+    mirror = CACHE / f"{r['name']}.git"
+    if not mirror.exists():
+        CACHE.mkdir(exist_ok=True)
+        res = subprocess.run(["git", "clone", "--quiet", "--bare", "--filter=blob:none", r["url"], str(mirror)],
+                             text=True, capture_output=True)
+        if res.returncode != 0:
+            return None, None
+    elif fetch:
+        git("fetch", "--quiet", "--prune", "origin", "+refs/heads/*:refs/heads/*", check=False, cwd=mirror)
+    return mirror, ""
+
+
+def default_branch(r, path, prefix):
+    if prefix:
+        ref = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False, cwd=path).stdout.strip()
+        if ref:
+            return ref.split("/", 1)[1]
+    else:
+        ref = git("symbolic-ref", "--short", "HEAD", check=False, cwd=path).stdout.strip()
+        if ref:
+            return ref
+    return r.get("default_branch") or "main"
+
+
+def git_merged(r, since):
+    """Work merged into the default branch since `since`, from git history (any host)."""
+    path, prefix = git_dir_for(r)
+    if not path:
+        return []
+    base = default_branch(r, path, prefix)
+    out = git("log", "--first-parent", f"{prefix}{base}", f"--since={since}", "--format=%cI%x09%an%x09%h%x09%s",
+              check=False, cwd=path).stdout.splitlines()
+    rows = []
+    for line in out:
+        date, author, sha, subject = (line.split("\t") + ["", "", "", ""])[:4]
+        rows.append({"number": sha, "title": subject, "author": author, "merged": date, "base": base,
+                     "url": f"{r['url'].removesuffix('.git')} @ {sha}"})
+    return rows
+
+
+def merged_work(r, since):
+    rows, err = host_merged_prs(r, since)
+    return rows if rows is not None else git_merged(r, since)
+
+
+def repo(name):
+    for r in load_repos():
+        if r["name"] == name:
+            return r
+    sys.exit(f"unknown repo '{name}'; see repos.yaml")
+
+
+def git(*args, check=True, cwd=ROOT):
+    return subprocess.run(["git", *args], cwd=cwd, check=check, text=True, capture_output=True)
+
+
+# ---------- commands ----------
+
+def cmd_where(name):
+    repo(name)
+    if not local_path(name):
+        scan_for_repos(force=True)
+    candidates = []
+    override = local_overrides().get(name)
+    if override:
+        candidates.append(Path(override))
+    candidates.append(repos_root() / name)
+    for c in candidates:
+        if (c / ".git").exists():
+            print(c)
+            return 0
+    print(f"not cloned: run `bin/home clone {name}` (expected at {candidates[-1]})", file=sys.stderr)
+    return 1
+
+
+def local_path(name):
+    override = local_overrides().get(name)
+    for c in ([Path(override)] if override else []) + [repos_root() / name]:
+        if (c / ".git").exists():
+            return c
+    return None
+
+
+LOCAL_STATE = ROOT / ".home-local.json"   # per machine, git-ignored
+SCAN_ROOTS = ("", "Desktop", "Documents", "Developer", "code", "dev", "projects", "src", "repos",
+              "workspace", "workspaces", "git", "github", "work", "orca")
+SKIP_DIRS = {"node_modules", "Library", "Applications", "Music", "Movies", "Pictures", ".Trash", "vendor", "dist"}
+
+
+def origin_of(repo_dir):
+    try:
+        text = (repo_dir / ".git" / "config").read_text()
+    except OSError:
+        return None
+    m = re.search(r'\[remote "origin"\][^\[]*?url\s*=\s*(\S+)', text)
+    return repo_slug(m.group(1)) if m else None
+
+
+def scan_for_repos(force=False):
+    """Find mapped repos cloned anywhere under the usual folders of $HOME, by their origin
+    URL, and remember them in repos.local.yaml. Runs at most once a day unless forced."""
+    state = json.loads(LOCAL_STATE.read_text()) if LOCAL_STATE.exists() else {}
+    today = dt.date.today().isoformat()
+    missing = {repo_slug(r["url"]): r["name"] for r in load_repos() if not local_path(r["name"])}
+    if not missing or (not force and state.get("last_scan") == today):
+        return []
+    home, found, seen = Path.home(), {}, {}
+
+    def walk(d, depth):
+        if depth < 0 or seen.get(d, -1) >= depth or not missing.keys() - found.keys():
+            return
+        seen[d] = depth
+        if (d / ".git").is_dir():
+            slug = origin_of(d)
+            if slug in missing and slug not in found:
+                found[slug] = d
+            return
+        try:
+            entries = [e for e in os.scandir(d) if e.is_dir(follow_symlinks=False)
+                       and not e.name.startswith(".") and e.name not in SKIP_DIRS]
+        except OSError:
+            return
+        for e in entries:
+            walk(Path(e.path), depth - 1)
+
+    for sub in SCAN_ROOTS:
+        root = home / sub if sub else home
+        if root.is_dir():
+            walk(root, 1 if not sub else 3)
+    if found:
+        lines = [f"{missing[s]}: {str(p).replace(str(home), '~', 1)}  # found by bin/home repos" for s, p in found.items()]
+        path = ROOT / "repos.local.yaml"
+        prev = path.read_text() if path.exists() else ""
+        path.write_text(prev + ("" if prev.endswith("\n") or not prev else "\n") + "\n".join(lines) + "\n")
+        cmd_setup(quiet=True)
+    state["last_scan"] = today
+    LOCAL_STATE.write_text(json.dumps(state, indent=2) + "\n")
+    return [missing[s] for s in found]
+
+
+def cmd_repos(brief=False, scan=False):
+    remember_brain()
+    scan_for_repos(force=scan)
+    here, missing = [], []
+    home = str(Path.home())
+    for r in load_repos():
+        path = local_path(r["name"])
+        if not path:
+            missing.append(r["name"])
+            continue
+        branch = git("rev-parse", "--abbrev-ref", "HEAD", check=False, cwd=path).stdout.strip() or "?"
+        shown = str(path).replace(home, "~", 1)
+        here.append(f"  {r['name']}  {shown}  [{branch}]" if brief else
+                    f"  {r['name']:<28} {shown:<48} [{branch}]  {r.get('kind','')}: {r.get('purpose','')}")
+    print(f"Repos on this machine ({len(here)} of {len(here) + len(missing)}; details in AGENTS.md > Repo map):")
+    print("\n".join(here) if here else "  none")
+    if missing:
+        print(f"Not cloned: {', '.join(missing)}. If the work needs one, tell the developer and clone it "
+              "(`bin/home clone <name>`) only after they confirm.")
+    return 0
+
+
+def cmd_clone(name):
+    r = repo(name)
+    target = Path(local_overrides().get(name, repos_root() / name))
+    if (target / ".git").exists():
+        print(target)
+        return 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "clone", r["url"], str(target)], check=True)
+    print(target)
+    return 0
+
+
+def cmd_sync(quiet=False):
+    if not git("remote", check=False).stdout.strip():
+        return 0
+    if rebasing():
+        print("home sync: a save is waiting on a merge (" + ", ".join(conflicted()) +
+              "). Merge those files, then run `bin/home save --continue`.", file=sys.stderr)
+        return 0
+    git("fetch", "--quiet", check=False)
+    ahead = unpushed()
+    res = git("rebase", "--autostash", "--quiet", "@{u}", check=False)
+    if res.returncode != 0 or rebasing():
+        files = settle_rebase()
+        if files:
+            git("rebase", "--abort", check=False)
+            print(f"home sync: {ahead} local commit(s) conflict with main in {', '.join(files)}. "
+                  "Run `bin/home save` and merge them.", file=sys.stderr)
+            return 0
+    if ahead and unpushed():
+        if git("push", "--quiet", check=False).returncode == 0:
+            print(f"home sync: pushed {ahead} commit(s) left from an earlier session")
+    return 0
+
+
+def wiki_pages():
+    for p in sorted(WIKI.rglob("*.md")):
+        if p.parent == WIKI and p.name in GENERATED:
+            continue
+        meta, body = parse_frontmatter(p.read_text())
+        yield p, meta, body
+
+
+def cmd_index():
+    groups = {}
+    for p, meta, _ in wiki_pages():
+        rel = p.relative_to(WIKI)
+        folder = rel.parts[0] if len(rel.parts) > 1 else "_root"
+        groups.setdefault(folder, []).append((rel, meta))
+    lines = [
+        "# Wiki index",
+        "",
+        "Generated by `bin/home index` from each page's frontmatter. Do not edit by hand.",
+        "Read this first, then open only the pages you need. Superseded pages are marked; prefer the page that replaces them.",
+        "",
+    ]
+    for folder in [f for f in FOLDER_TITLES if f in groups] + sorted(f for f in groups if f not in FOLDER_TITLES):
+        lines.append(f"## {FOLDER_TITLES.get(folder, folder)}")
+        lines.append("")
+        for rel, meta in sorted(groups[folder], key=lambda x: str(x[0])):
+            title = meta.get("title", rel.stem)
+            summary = meta.get("summary", "(no summary)")
+            status = meta.get("status", "")
+            tag = f" `{status}`" if status and status not in ("active", "accepted") else ""
+            lines.append(f"- [{title}]({rel.as_posix()}){tag}: {summary}")
+        lines.append("")
+    (WIKI / "index.md").write_text("\n".join(lines).rstrip() + "\n")
+    return 0
+
+
+def cmd_pointers():
+    repos = load_repos()
+    by_project = {}
+    for r in repos:
+        for proj in r.get("projects", []) or ["other"]:
+            by_project.setdefault(proj, []).append(r)
+    out = [
+        "<!-- repos:start (generated by `bin/home pointers` from repos.yaml; edit repos.yaml instead) -->",
+        "Path = `$HOME_REPOS_ROOT/<name>` (default: the folder that contains this home repo), or anywhere `bin/home repos` finds it; `bin/home repos` lists what is on this machine. A repo that isn't cloned: tell the developer and run `bin/home clone <name>` only after they confirm.",
+        "",
+    ]
+    for r in repos:
+        projects = ", ".join(r.get("projects", []))
+        out.append(
+            f"- **{r['name']}** ({r.get('kind','')}; {projects}): {r.get('purpose','')} "
+            f"Stack: {r.get('stack','')}. {r['url']}. "
+            f"Read its {r.get('read_first','README.md')} before changing it."
+        )
+    out.append("<!-- repos:end -->")
+    agents = ROOT / "AGENTS.md"
+    text = agents.read_text()
+    new = re.sub(r"<!-- repos:start.*?<!-- repos:end -->", "\n".join(out), text, flags=re.S)
+    agents.write_text(new)
+    return 0
+
+
+
+
+def remember_brain():
+    """Record this checkout's path where every connected repo's home.sh looks first, so repos
+    cloned in different folders all find the same home repo."""
+    cfg = Path.home() / ".config" / "agent-home" / NAME
+    try:
+        if not cfg.exists() or cfg.read_text().strip() != str(ROOT):
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            cfg.write_text(str(ROOT) + "\n")
+    except OSError:
+        pass
+
+
+def cmd_discover():
+    if not CFG["owners"]:
+        print("no owners in home.yaml; nothing to discover")
+        return 0
+    state = load_state()
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = state.get("repos_created_since")
+    if not since:
+        state["repos_created_since"] = now
+        STATE.write_text(json.dumps(state, indent=2) + "\n")
+        print(f"baseline set: repos created after {now} will be added")
+        return 0
+    known = {r["name"] for r in load_repos()} | {NAME} | set(state.get("repos_ignored", []))
+    added = []
+    for owner in CFG["owners"]:
+        rows, err = host_list_repos(owner)
+        if err:
+            print(f"{owner}: {err}", file=sys.stderr)
+            continue
+        for row in sorted(rows, key=lambda x: x["created"]):
+            if row["created"] <= since or row["archived"] or row["name"] in known:
+                continue
+            desc = row["description"].replace("\n", " ").strip()
+            added.append("\n".join([
+                f"- name: {row['name']}", f"  org: {owner}", f"  url: {row['url']}",
+                f"  default_branch: {row['default_branch']}", "  projects: []", "  kind: new",
+                f"  stack: {row['language']}",
+                f"  purpose: NEW (added {row['created'][:10]}, not described yet). {desc}".rstrip(),
+                "  read_first: README.md",
+            ]))
+    if added:
+        with open(ROOT / "repos.yaml", "a") as f:
+            f.write("\n" + "\n\n".join(added) + "\n")
+        cmd_pointers()
+    state["repos_created_since"] = now
+    STATE.write_text(json.dumps(state, indent=2) + "\n")
+    names = [a.splitlines()[0][8:] for a in added]
+    print(f"added {len(added)} new repo(s): {', '.join(names)}" if added else "no new repos")
+    return 0
+
+
+def cmd_now():
+    today = dt.date.today()
+    since = (today - dt.timedelta(days=7)).isoformat()
+    lines = [
+        "# Now", "",
+        f"Generated by `bin/home now` on {today.isoformat()}. Do not edit by hand.",
+        "What is happening: active specs, open pull requests and the last 7 days of merges across every repo in repos.yaml.",
+        "Branch-level detail: [branches](branches.md).", "",
+        "## Active specs", "",
+    ]
+    active = []
+    for spec in sorted(SPECS.glob("*/spec.md")):
+        meta = spec_meta(spec.read_text())
+        status = meta.get("status", "draft").split()[0].strip("`*")
+        if status not in ("merged", "abandoned"):
+            repos = meta.get("repos") if isinstance(meta.get("repos"), str) else ", ".join(meta.get("repos") or [])
+            active.append(f"- `{status}` [{meta.get('title', spec.parent.name)}](../specs/{spec.parent.name}/spec.md)"
+                          f" · owner {meta.get('owner', '?')} · repos {repos}")
+    lines += active or ["- none"]
+    open_rows, merged_rows, notes = [], [], []
+    for r in load_repos():
+        prs, err = host_open_prs(r)
+        if err:
+            notes.append(f"- {r['name']}: {err}")
+        for p in prs or []:
+            draft = " (draft)" if p["draft"] else ""
+            open_rows.append(f"- **{r['name']}** [#{p['number']} {p['title']}]({p['url']}){draft}"
+                             f" · {p['author']} · `{p['branch']}` · updated {p['updated'][:10]}")
+        for p in merged_work(r, since):
+            merged_rows.append(f"- {p['merged'][:10]} **{r['name']}** {p['number']} {p['title']} → `{p['base']}` · {p['author']}")
+    lines += ["", "## Open pull requests", ""] + (open_rows or ["- none"])
+    lines += ["", f"## Merged since {since}", ""] + (sorted(merged_rows, reverse=True) or ["- none"])
+    if notes:
+        lines += ["", "## Not read from the host", ""] + notes
+    (WIKI / "now.md").write_text("\n".join(lines) + "\n")
+    return 0
+
+
+def cmd_branches(days="14"):
+    """Deploy branches against the default branch, and recently active branches, from git (any host)."""
+    today = dt.datetime.now(dt.timezone.utc)
+    since = (today - dt.timedelta(days=int(days))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        "# Branches", "",
+        f"Generated by `bin/home branches` on {today.date().isoformat()}. Do not edit by hand.",
+        f"Per repo: deploy branches compared with the default branch, then every branch with commits in the last {days} days.", "",
+    ]
+    errors = []
+    for r in load_repos():
+        path, prefix = git_dir_for(r)
+        if not path:
+            errors.append(f"- {r['name']}: not readable with your git access")
+            continue
+        default = default_branch(r, path, prefix)
+        refs = git("for-each-ref", f"refs/remotes/origin/" if prefix else "refs/heads/",
+                   "--format=%(refname:short)%09%(committerdate:iso-strict)%09%(authorname)%09%(subject)",
+                   check=False, cwd=path).stdout.splitlines()
+        rows = []
+        for line in refs:
+            ref, date, author, subject = (line.split("\t") + ["", "", "", ""])[:4]
+            name = ref[len("origin/"):] if prefix and ref.startswith("origin/") else ref
+            if name in ("HEAD", "origin"):
+                continue
+            rows.append({"name": name, "ref": ref, "date": date, "author": author, "subject": subject})
+        deploy = [b for b in rows if b["name"] in DEPLOY_BRANCHES and b["name"] != default]
+        active = sorted([b for b in rows if b["name"] not in DEPLOY_BRANCHES and b["name"] != default and b["date"] >= since],
+                        key=lambda b: b["date"], reverse=True)
+        dflt = next((b for b in rows if b["name"] == default), None)
+
+        def drift(b):
+            out = git("rev-list", "--left-right", "--count", f"{prefix}{default}...{b['ref']}", check=False, cwd=path).stdout.split()
+            return (out[1], out[0]) if len(out) == 2 else ("?", "?")
+
+        lines += [f"## {r['name']}", ""]
+        if dflt:
+            lines += [f"Default `{default}`: last commit {dflt['date'][:10]} by {dflt['author']}: {dflt['subject']}", ""]
+        if deploy:
+            lines += ["| Deploy branch | vs default | Last commit |", "|---|---|---|"]
+            for b in deploy:
+                ahead, behind = drift(b)
+                lines.append(f"| `{b['name']}` | {ahead} ahead, {behind} behind | {b['date'][:10]} {b['author']}: {b['subject']} |")
+            lines.append("")
+        if active:
+            lines += [f"Active branches ({len(active)}):", ""]
+            for b in active:
+                ahead, behind = drift(b)
+                lines.append(f"- `{b['name']}` · {b['author']} · {b['date'][:10]} · {ahead} ahead / {behind} behind")
+                log = git("log", "--format=%h %s (%an)", "-5", f"{prefix}{default}..{b['ref']}", check=False, cwd=path).stdout.splitlines()
+                lines += [f"  - {c}" for c in log]
+            lines.append("")
+        if not deploy and not active:
+            lines += ["No deploy branches and no branch activity in the window.", ""]
+    if errors:
+        lines += ["## Not readable", ""] + errors
+    (WIKI / "branches.md").write_text("\n".join(lines).rstrip() + "\n")
+    return 0
+
+
+def load_state():
+    return json.loads(STATE.read_text()) if STATE.exists() else {}
+
+
+def cmd_pending(done=False, brief=False):
+    state = load_state()
+    since = state.get("merged_since") or state.get("github_merged_since") or (dt.date.today() - dt.timedelta(days=14)).isoformat()
+    if done:
+        state["merged_since"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        state.pop("github_merged_since", None)
+        STATE.write_text(json.dumps(state, indent=2) + "\n")
+        print(f"marked ingested up to {state['merged_since']}")
+        return 0
+    rows = []
+    for r in load_repos():
+        for p in merged_work(r, since):
+            rows.append((p["merged"], r["name"], p))
+    rows.sort(key=lambda x: (x[0], x[1]))
+    if brief:
+        if rows:
+            print(f"{NAME}: {len(rows)} merged changes since {since[:10]} not yet in the wiki. "
+                  "Ingest them in the background with the wiki-ingest skill (From the host), without asking.")
+        return 0
+    print(f"{len(rows)} merged changes since {since} not yet ingested")
+    for merged, name, p in rows:
+        print(f"- {merged[:10]} {name} {p['number']} → {p['base']} · {p['author']} · {p['title']} · {p['url']}")
+    return 0
+
+
+def cmd_prs(name=None):
+    """Open pull requests, for overlap checks (one repo or all)."""
+    for r in [repo(name)] if name else load_repos():
+        prs, err = host_open_prs(r)
+        if err:
+            print(f"{r['name']}: {err} (see wiki/branches.md for active branches)")
+            continue
+        for p in prs:
+            print(f"{r['name']} #{p['number']} {p['title']} · {p['author']} · {p['branch']} · {p['url']}")
+    return 0
+
+
+def cmd_pr(args):
+    """bin/home pr <repo> <base> <head> <title> <body-file> [labels...]: open a draft PR or MR on any host."""
+    name, base, head, title, body = args[:5]
+    r = repo(name)
+    out, err = host_create_pr(r, local_path(name) or ROOT, base, head, title, body, tuple(args[5:]))
+    print(out)
+    return 1 if err else 0
+
+
+def upsert_section(path, section, header=None):
+    start, end = "<!-- agent-home:start", "<!-- agent-home:end -->"
+    text = path.read_text() if path.exists() else (header or "")
+    if start in text:
+        text = re.sub(re.escape(start) + r".*?" + re.escape(end), section.strip(), text, flags=re.S)
+    else:
+        text = text.rstrip("\n") + ("\n\n" if text.strip() else "") + section.strip() + "\n"
+    path.write_text(text if text.endswith("\n") else text + "\n")
+
+
+def remote_url_of(path):
+    return git("remote", "get-url", "origin", check=False, cwd=path).stdout.strip()
+
+
+def register_repo(path):
+    """Add a local checkout to repos.yaml (if it isn't there yet) and return its name."""
+    url = remote_url_of(path)
+    slug = repo_slug(url) if url else None
+    for r in load_repos():
+        if slug and repo_slug(r["url"]) == slug:
+            return r["name"]
+    parts = (slug or f"local/{path.name}").split("/")
+    name, owner = parts[-1], (parts[-2] if len(parts) > 2 else "local")
+    default = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False, cwd=path).stdout.strip().split("/", 1)[-1] or "main"
+    with open(ROOT / "repos.yaml", "a") as f:
+        f.write("\n" + "\n".join([
+            f"- name: {name}", f"  org: {owner}", f"  url: {url or path}", f"  default_branch: {default}",
+            "  projects: []", "  kind: unknown", "  stack: unknown", "  purpose: Connected by hand; describe it.", "  read_first: README.md",
+        ]) + "\n")
+    if path.resolve().parent != repos_root().resolve():
+        lp = ROOT / "repos.local.yaml"
+        prev = lp.read_text() if lp.exists() else ""
+        lp.write_text(prev + ("" if prev.endswith("\n") or not prev else "\n") + f"{name}: {path.resolve()}\n")
+    cmd_pointers()
+    return name
+
+
+def write_connection(target):
+    (target / ".agents").mkdir(exist_ok=True)
+    home_sh = target / ".agents" / "home.sh"
+    url = remote_url_of(ROOT) or str(ROOT)
+    home_sh.write_text((CONNECT / "home.sh").read_text().replace("__HOME_NAME__", NAME).replace("__HOME_URL__", url))
+    home_sh.chmod(0o755)
+    section = (CONNECT / "agents-section.md").read_text().replace("__HOME_NAME__", NAME).replace("__HOME_URL__", url)
+    upsert_section(target / "AGENTS.md", section, header="# AGENTS.md\n\nInstructions for coding agents working in this repo.\n")
+    claude = target / "CLAUDE.md"
+    if not claude.exists():
+        claude.write_text("@AGENTS.md\n")
+    elif "@AGENTS.md" not in claude.read_text():
+        upsert_section(claude, section)
+    settings_path = target / ".claude" / "settings.json"
+    settings_path.parent.mkdir(exist_ok=True)
+    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    hook = {"type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.agents/home.sh\" sync", "timeout": 30}
+    starts = settings.setdefault("hooks", {}).setdefault("SessionStart", [])
+    if not any("home.sh" in h.get("command", "") for s in starts for h in s.get("hooks", [])):
+        starts.append({"hooks": [hook]})
+    allow = settings.setdefault("permissions", {}).setdefault("allow", [])
+    if "Bash(bash .agents/home.sh:*)" not in allow:
+        allow.insert(0, "Bash(bash .agents/home.sh:*)")
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    subprocess.run(["bash", str(home_sh), "link"], cwd=target, capture_output=True)
+    return [".agents/home.sh", "AGENTS.md", "CLAUDE.md", ".claude/settings.json"]
+
+
+def cmd_connect(target, open_pr=False):
+    """connect <path>: write the connection into that checkout (you commit it).
+    connect <repo name> [--pr]: on branch chore/connect-<home>, in a worktree; --pr pushes it and opens a PR."""
+    as_path = Path(target).expanduser()
+    if target in (".", "..") or "/" in target or (as_path / ".git").exists():
+        path = Path(git("rev-parse", "--show-toplevel", cwd=as_path).stdout.strip())
+        name = register_repo(path)
+        files = write_connection(path)
+        cmd_setup(quiet=True)
+        print(f"{name}: connected in {path}. Review and commit: git add {' '.join(files)}")
+        return 0
+    r = repo(target)
+    main_path = local_path(target)
+    if not main_path:
+        sys.exit(f"{target} is not cloned; run `bin/home clone {target}` first")
+    git("fetch", "--quiet", "origin", cwd=main_path)
+    default = default_branch(r, main_path, "origin/")
+    branch = f"chore/connect-{NAME}"
+    wt = main_path.parent / f"{main_path.name}--connect-home"
+    if not wt.exists():
+        has_branch = git("show-ref", "--quiet", f"refs/heads/{branch}", check=False, cwd=main_path).returncode == 0
+        if has_branch:
+            git("worktree", "add", str(wt), branch, cwd=main_path)
+        else:
+            git("worktree", "add", "--no-track", "-b", branch, str(wt), f"origin/{default}", cwd=main_path)
+    files = write_connection(wt)
+    git("add", *files, cwd=wt)
+    if git("diff", "--cached", "--quiet", check=False, cwd=wt).returncode != 0:
+        git("commit", "-m", f"Connect this repo to {NAME} (shared agent skills, specs, wiki)", cwd=wt)
+    print(f"{target}: {wt} on {branch} (base {default})")
+    if open_pr:
+        git("push", "--quiet", "-u", "origin", branch, cwd=wt)
+        out, _ = host_create_pr(r, wt, default, branch, f"Connect this repo to {NAME} (shared agent skills and wiki)",
+                                CONNECT / "pr-body.md")
+        print(out)
+    return 0
+
+
+def cmd_init(args):
+    """init <name> [--host github|gitlab|bitbucket|none] [--owner X]...: set this home repo up."""
+    name = args[0] if args and not args[0].startswith("--") else ROOT.name
+    host, owners, i = "github", [], 0
+    while i < len(args):
+        if args[i] == "--host":
+            host, i = args[i + 1], i + 2
+        elif args[i] == "--owner":
+            owners.append(args[i + 1]); i += 2
+        else:
+            i += 1
+    CONFIG_FILE.write_text(
+        f"# {name}: home repo settings (see README.md)\n"
+        f"name: {name}\n"
+        f"host: {host}              # github | gitlab | bitbucket | none\n"
+        f"owners: [{', '.join(owners)}]   # orgs, groups or workspaces whose new repos join repos.yaml\n"
+        "deploy_branches: [main, master, production, staging]   # branches that deploy when pushed\n")
+    if not (ROOT / "repos.yaml").exists() or "- name:" not in (ROOT / "repos.yaml").read_text():
+        (ROOT / "repos.yaml").write_text(
+            "# Every repo an agent may need. `bin/home connect <path>` adds one; `bin/home discover` adds new ones\n"
+            "# from the owners in home.yaml. One \"- name:\" block per repo, scalar values, `projects` inline.\n")
+    for f, body in (("log.md", "# Log\n\nAppend-only. `bin/home log <type> <title>`.\n"),):
+        if not (WIKI / f).exists():
+            (WIKI / f).write_text(body)
+    STATE.write_text(json.dumps({"merged_since": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}, indent=2) + "\n")
+    ci = {"github": (".github/workflows/wiki-ingest.yml", "github-wiki-ingest.yml"),
+          "gitlab": (".gitlab-ci.yml", "gitlab-ci.yml"),
+          "bitbucket": ("bitbucket-pipelines.yml", "bitbucket-pipelines.yml")}.get(host)
+    if ci:
+        dest = ROOT / ci[0]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            dest.write_text((ROOT / "templates" / "ci" / ci[1]).read_text())
+    global CFG, NAME, HOST
+    CFG = load_config(); NAME = CFG["name"]; HOST = CFG["host"]
+    if owners:
+        cmd_discover()
+    cmd_index()
+    cmd_pointers()
+    remember_brain()
+    print(f"{name} ready (host: {host}). Connect a repo: bin/home connect <path>")
+    return 0
+
+
+def cmd_setup(quiet=False):
+    remember_brain()
+    dirs = {str(repos_root())} | {str(Path(p).parent) for p in local_overrides().values()}
+    path = ROOT / ".claude" / "settings.local.json"
+    data = json.loads(path.read_text()) if path.exists() else {}
+    current = data.setdefault("permissions", {}).setdefault("additionalDirectories", [])
+    for d in sorted(dirs):
+        if d not in current:
+            current.append(d)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    if not quiet:
+        print(f"Claude Code in {NAME} may now work in: {', '.join(current)}")
+    return 0
+
+
+def cmd_log(kind, title):
+    with open(WIKI / "log.md", "a") as f:
+        f.write(f"\n## [{dt.date.today().isoformat()}] {kind} | {title}\n")
+    return 0
+
+
+def cmd_check():
+    problems = []
+    pages = list(wiki_pages())
+    by_rel = {p.relative_to(WIKI).as_posix(): (p, meta) for p, meta, _ in pages}
+    inbound = {rel: 0 for rel in by_rel}
+    link_re = re.compile(r"\]\(([^)#\s]+\.md)(#[^)]*)?\)")
+    for p, meta, body in pages:
+        rel = p.relative_to(WIKI).as_posix()
+        for key in REQUIRED:
+            if not meta.get(key):
+                problems.append(f"{rel}: missing frontmatter `{key}`")
+        if meta.get("type") and meta["type"] not in TYPES:
+            problems.append(f"{rel}: unknown type `{meta['type']}`")
+        for target in ("superseded_by", "supersedes"):
+            if meta.get(target):
+                ref = (p.parent / meta[target]).resolve()
+                if not ref.exists():
+                    problems.append(f"{rel}: {target} points to missing {meta[target]}")
+        for src in meta.get("sources", []) if isinstance(meta.get("sources"), list) else []:
+            if src.startswith("raw/") and not (ROOT / src).exists():
+                problems.append(f"{rel}: source not found {src}")
+        if meta.get("superseded_by") and meta.get("status") != "superseded":
+            problems.append(f"{rel}: has superseded_by but status is not `superseded`")
+        for m in link_re.finditer(body):
+            target = m.group(1)
+            if target.startswith("http"):
+                continue
+            ref = (p.parent / target).resolve()
+            if not ref.exists():
+                problems.append(f"{rel}: broken link {target}")
+            else:
+                try:
+                    key = ref.relative_to(WIKI.resolve()).as_posix()
+                    if key in inbound and key != rel:
+                        inbound[key] += 1
+                except ValueError:
+                    pass
+    for rel, count in inbound.items():
+        if count == 0:
+            problems.append(f"{rel}: orphan (no page links to it; index.md does not count)")
+    for line in problems:
+        print(line)
+    print(f"{len(pages)} pages, {len(problems)} problems")
+    return 1 if problems else 0
+
+
+# Files the tools regenerate: on a conflict, take the team's version and regenerate.
+REGENERATED = ("wiki/index.md", "wiki/now.md", "wiki/branches.md", "ingest-state.json")
+
+
+def rebasing():
+    gitdir = Path(git("rev-parse", "--git-dir").stdout.strip())
+    gitdir = gitdir if gitdir.is_absolute() else ROOT / gitdir
+    return (gitdir / "rebase-merge").exists() or (gitdir / "rebase-apply").exists()
+
+
+def conflicted():
+    return [l for l in git("diff", "--name-only", "--diff-filter=U", check=False).stdout.splitlines() if l]
+
+
+def settle_rebase():
+    """Drive a rebase in progress to the end, resolving regenerated files on its own.
+    Returns the files a person or agent must merge by hand (empty when it finished)."""
+    env = {**os.environ, "GIT_EDITOR": "true"}
+    for _ in range(50):
+        if not rebasing():
+            return []
+        files = conflicted()
+        manual = [f for f in files if f not in REGENERATED]
+        if manual:
+            return manual
+        for f in files:
+            # During a rebase "ours" is the team's main; the file is regenerated afterwards.
+            git("checkout", "--ours", "--", f, check=False)
+            if f == "wiki/index.md":
+                cmd_index()
+            git("add", f)
+        left = [f for f in git("diff", "--name-only", check=False).stdout.splitlines() if f]
+        if left:
+            git("add", *left)
+        res = subprocess.run(["git", "rebase", "--continue"], cwd=ROOT, env=env, text=True, capture_output=True)
+        if res.returncode != 0 and not conflicted():
+            # Nothing left to apply in this commit (the team already had it).
+            subprocess.run(["git", "rebase", "--skip"], cwd=ROOT, env=env, text=True, capture_output=True)
+    return conflicted()
+
+
+def report_conflict(files):
+    print("CONFLICT: someone changed the same lines on main. Files to merge:", file=sys.stderr)
+    for f in files:
+        print(f"  {f}", file=sys.stderr)
+    print("Between <<<<<<< and >>>>>>>, the first side is the team's main and the second is your change. "
+          "Keep what each side adds; if they contradict, keep the fact verified against the code and mark "
+          "the page `status: draft` (wiki-ingest > Conflicts). Remove the markers, then run "
+          "`bin/home save --continue`.", file=sys.stderr)
+    return 3
+
+
+def unpushed():
+    res = git("rev-list", "--count", "@{u}..HEAD", check=False)
+    return int(res.stdout.strip() or 0) if res.returncode == 0 else 0
+
+
+def pull_and_push():
+    for _ in range(3):
+        git("fetch", "--quiet", check=False)
+        if not rebasing():
+            git("rebase", "--autostash", "--quiet", "@{u}", check=False)
+        files = settle_rebase()
+        if files:
+            return report_conflict(files)
+        cmd_index()
+        if git("status", "--porcelain", "--", "wiki/index.md").stdout.strip():
+            git("add", "wiki/index.md")
+            git("commit", "--quiet", "-m", "wiki: regenerate index")
+        if git("push", "--quiet", check=False).returncode == 0:
+            print("saved and pushed")
+            return 0
+    print("push failed 3 times; commit kept locally (the next session start retries)", file=sys.stderr)
+    return 1
+
+
+def cmd_save(message, cont=False):
+    has_remote = bool(git("remote", check=False).stdout.strip())
+    if cont:
+        files = conflicted()
+        marked = [f for f in files if "<<<<<<<" in (ROOT / f).read_text(errors="ignore")]
+        if marked:
+            return report_conflict(marked)
+        git("add", "-A")
+        return pull_and_push() if has_remote else 0
+    if rebasing():
+        return report_conflict(conflicted() or ["(a rebase is in progress)"])
+    cmd_index()
+    git("add", "-A")
+    staged = [l for l in git("diff", "--cached", "--name-only").stdout.splitlines() if l]
+    if not staged and not (has_remote and unpushed()):
+        print("nothing to save")
+        return 0
+    protected = [f for f in staged if f.startswith(PROTECTED)] if PROTECTED_VIA_PR else []
+    if protected and has_remote:
+        branch = "wiki/" + re.sub(r"[^a-z0-9]+", "-", message.lower()).strip("-")[:40] + "-" + dt.datetime.now().strftime("%m%d%H%M")
+        git("switch", "-c", branch)
+        git("commit", "-m", message)
+        git("push", "-u", "origin", branch)
+        me = {"org": "", "name": NAME, "url": remote_url_of(ROOT)}
+        print(host_create_pr(me, ROOT, "main", branch, message, CONNECT / "pr-body.md")[0])
+        git("switch", "main")
+        print(f"protected paths changed ({', '.join(protected)}): opened a PR from {branch}")
+        return 0
+    if staged:
+        git("commit", "-m", message)
+    if not has_remote:
+        print("saved locally (no remote yet)")
+        return 0
+    return pull_and_push()
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, args = argv[1], argv[2:]
+    if cmd == "where" and args:
+        return cmd_where(args[0])
+    if cmd == "clone" and args:
+        return cmd_clone(args[0])
+    if cmd == "repos":
+        return cmd_repos(brief="--brief" in args, scan="--scan" in args)
+    if cmd == "discover":
+        return cmd_discover()
+    if cmd == "sync":
+        return cmd_sync(quiet="--quiet" in args)
+    if cmd == "index":
+        return cmd_index()
+    if cmd == "pointers":
+        return cmd_pointers()
+    if cmd == "now":
+        return cmd_now()
+    if cmd == "branches":
+        return cmd_branches(args[0] if args else "14")
+    if cmd == "pending":
+        return cmd_pending(done="--done" in args, brief="--brief" in args)
+    if cmd == "setup":
+        return cmd_setup(quiet="--quiet" in args)
+    if cmd == "connect" and args:
+        return cmd_connect(args[0], open_pr="--pr" in args)
+    if cmd == "init":
+        return cmd_init(args)
+    if cmd == "prs":
+        return cmd_prs(args[0] if args else None)
+    if cmd == "pr" and len(args) >= 5:
+        return cmd_pr(args)
+    if cmd == "log" and len(args) >= 2:
+        return cmd_log(args[0], " ".join(args[1:]))
+    if cmd == "check":
+        return cmd_check()
+    if cmd == "save" and args == ["--continue"]:
+        return cmd_save("", cont=True)
+    if cmd == "save" and args:
+        return cmd_save(" ".join(args))
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

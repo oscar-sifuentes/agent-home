@@ -1,0 +1,2 @@
+# Append-only log: concurrent appends from several people merge without conflicts.
+wiki/log.md merge=union

@@ -1,0 +1,22 @@
+# Daily wiki ingest. Add a schedule for the "wiki-ingest" custom pipeline (Pipelines > Schedules).
+# Repository variables: HOME_PUSH_TOKEN (repository or workspace access token that can read every
+# repo in repos.yaml and push here) and CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY (secured).
+# Bitbucket has no adapter yet: merged work comes from git history (first-parent commits).
+image: node:22
+pipelines:
+  custom:
+    wiki-ingest:
+      - step:
+          name: Wiki ingest
+          clone:
+            depth: full
+          script:
+            - apt-get update -qq && apt-get install -y -qq python3 >/dev/null
+            - git config user.name "home bot" && git config user.email "home-bot@noreply"
+            - git config --global url."https://x-token-auth:${HOME_PUSH_TOKEN}@bitbucket.org/".insteadOf "https://bitbucket.org/"
+            - git remote set-url origin "https://x-token-auth:${HOME_PUSH_TOKEN}@bitbucket.org/${BITBUCKET_REPO_FULL_NAME}.git"
+            - git checkout -B "$BITBUCKET_BRANCH" "origin/$BITBUCKET_BRANCH" && git branch -u "origin/$BITBUCKET_BRANCH"
+            - bin/home now && bin/home branches 14
+            - npm install -g @anthropic-ai/claude-code >/dev/null
+            - claude -p 'You maintain the wiki of this home repo. Read AGENTS.md, then follow .agents/skills/wiki-ingest/SKILL.md, section "From the host", for the work listed by `bin/home pending`. wiki/now.md and wiki/branches.md are already regenerated. If `bin/home discover` added repos to repos.yaml (purpose starts with "NEW"), describe them from their README and run `bin/home pointers`. Write only under wiki/ and raw/ and to repos.yaml, never secrets or personal data. When done run `bin/home pending --done`, `bin/home log ingest "<summary>"`, `bin/home index`, `bin/home check` (fix what it reports), then `bin/home save "wiki: daily ingest"`; if it reports a CONFLICT, merge as wiki-ingest > Conflicts says and run `bin/home save --continue`.' --allowedTools "Read,Write,Edit,Glob,Grep,Bash(bin/home:*),Bash(git log:*),Bash(git diff:*)"
+            - bin/home save "wiki: daily ingest $(date -u +%F)"
