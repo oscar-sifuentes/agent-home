@@ -47,6 +47,7 @@ Lead with what the reader must decide or check, then the detail. Rewrite for the
 - The problem and the user stories as cards.
 - Tickets as `waves`, one column per dependency level, from the "Blocked by" lines, with each ticket's repo when the spec spans several. **No tickets yet** (right after `/to-spec`): leave out the waves and the ticket counts, show the repos as chips, and end with a `callout`: "Approve the spec, then `/to-tickets` splits it".
 - Invariants table: number, invariant, the ticket that proves it.
+- Don't copy ticket bodies into the spec view. When you pass the ticket files as sources, `build.mjs` adds a **Tickets** tab with every ticket in full, verbatim from its markdown, and links each wave card's number (`<div class="no">NN</div>`, keep that exact markup) to it.
 - Open questions (`qa .open`) near the top if any block a ticket.
 - Out of scope, test seams, docs checked, e2e scenarios: shorter, in `details` when long.
 
