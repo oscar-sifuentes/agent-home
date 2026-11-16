@@ -21,6 +21,8 @@ Each code repo keeps its own `AGENTS.md` (commands, conventions, risk zones, dom
 
 Whenever you learn something that will be needed again, write it down with the `wiki-ingest` skill and save it with `bin/home save "<message>"`. Don't ask for permission. Worth a page: a decision and why; a root cause and fix; an operational how-to (access, deploys, local setup); a fact someone had to ask for; an answer the developer gave you that a future agent would ask again. Not worth a page: routine commits, what the code or its README already says, anything that only matters to this session.
 
+**Plans save themselves.** Every write under `specs/<slug>/` (grill notes, the spec, tickets, any status change) is followed in the same step by `bin/home save "<skill>: <slug> <what>"`, without asking. A power cut or a closed laptop then loses at most the last answer, and the next session (any agent) continues from the files: run the same skill again with the slug.
+
 ## Page format
 
 One file per page, kebab-case. Decisions and incidents start with their date: `wiki/decisions/2026-01-15-use-postgres-for-jobs.md`.

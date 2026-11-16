@@ -21,9 +21,10 @@ Split the spec into tickets that an agent can build one at a time in a fresh con
 ## Steps
 
 1. Read the spec. Stop if its status is not `approved`.
-2. Draft the tickets. Show them as a numbered list: title, repo, zone, blocked by, what it delivers. Keep the tickets of every repo in this one spec; never tell the developer to run `/deliver` from another repo.
-3. Ask: is the size right, are the edges right, should any be merged or split? Iterate until the developer approves.
-4. Write one file per ticket: `<home>/specs/<slug>/tickets/NN-<short-title>.md`, numbered in dependency order, from `01`.
+2. Draft the tickets and **write them right away**, one file per ticket: `<home>/specs/<slug>/tickets/NN-<short-title>.md`, numbered in dependency order from `01`, with `Status: draft`, then save: `<home>/bin/home save "tickets: <slug> draft"` (no need to ask). Keep the tickets of every repo in this one spec; never tell the developer to run `/deliver` from another repo. If draft tickets already exist, an earlier run stopped: keep them and continue at step 3.
+3. Run the `render-html` skill in `spec <slug>` mode: one page with the spec and every ticket in full (its Tickets tab). Give the developer the path and a short table (number, title, repo, zone, blocked by).
+4. Ask: is the size right, are the edges right, should any be merged or split? Apply the answers to the files, save (`tickets: <slug> <what changed>`) and render the page again, until the developer approves.
+5. On approval set every ticket to `Status: ready` and save: `<home>/bin/home save "tickets: <slug>"`.
 
 ## Ticket template
 
@@ -33,7 +34,7 @@ Split the spec into tickets that an agent can build one at a time in a fresh con
 - **Repo:** <primary repo> | <related repo name from repos.yaml>
 - **Zone:** 🔴 | 🟡 | 🟢
 - **Blocked by:** 01, 02 | none
-- **Status:** ready | in-progress | done
+- **Status:** draft | ready | in-progress | done
 
 ## What it delivers
 The end-to-end behaviour, from the user's side.

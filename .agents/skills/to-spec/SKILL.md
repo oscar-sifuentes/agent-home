@@ -10,7 +10,7 @@ Write the spec from what is already decided. Don't interview, with one exception
 
 ## Steps
 
-1. Explore the modules the change touches and read their READMEs, so the spec uses the code's names.
+1. Read `<home>/specs/<slug>/grill.md` if the grill left one (it holds the decisions, not the chat). If `spec.md` already exists, an earlier run stopped: continue editing it instead of starting over. Explore the modules the change touches and read their READMEs, so the spec uses the code's names.
 2. Choose the **test seams**: the public boundaries the tests will exercise (a controller route, a service method, a guard). Prefer existing seams and the highest one that works. Fewer is better.
 3. **Check the library decisions against the docs.** For each decision that relies on how an external library or framework behaves (a Nest guard or pipe, a TypeORM query or transaction, a class-validator rule, an HTTP client option, a provider SDK), look it up with Context7 for the version in `package.json`, as `AGENTS.md` describes. If the docs disagree with the plan, that is a decision: ask the developer, with your recommended fix. Record what you checked under "Docs checked". Skip this step when the spec relies on no library behaviour.
 4. **Sort what is still open** before writing it down; only the first kind goes in "Open questions":
@@ -20,7 +20,7 @@ Write the spec from what is already decided. Don't interview, with one exception
    - **Decisions**: never here; see above.
 5. Pick a short kebab-case slug and write `<home>/specs/<slug>/spec.md` with the template below. Publish it right away so teammates see it: `<home>/bin/home save "spec: <slug> draft"` (no need to ask). Save again whenever you edit it.
 6. Run the `render-html` skill in `spec <slug>` mode (in Claude Code, the `html-renderer` sub-agent): there are no tickets yet, so the page shows the spec alone. The developer reads **the page**, not the markdown.
-7. Show the developer the page path (`.review/specs/<slug>/index.html`; on macOS `open <path>`) and, in a few lines, the zone, the repos, the invariants and any decision the docs changed. They approve the spec before `/to-tickets`. When they ask for changes, edit `spec.md` and render the page again.
+7. Show the developer the page path (`.review/specs/<slug>/index.html`; on macOS `open <path>`) and, in a few lines, the zone, the repos, the invariants and any decision the docs changed. They approve the spec before `/to-tickets`. When they ask for changes, edit `spec.md`, save, and render the page again. On approval set `status: approved` and save (`spec: <slug> approved`) before anything else.
 
 Don't put file paths or code in the spec, except a type or state machine that states a decision more precisely than prose.
 

@@ -15,6 +15,12 @@ Interview the developer until the plan has no open decisions. Questions only; no
 3. Read the team wiki for context (`wiki-query`): the project, repo and provider pages, and past decisions and incidents in the area. Don't ask what the wiki answers.
 4. Guess the risk zone from what the change touches. Tell the developer your guess in one line.
 
+5. Pick the spec's kebab-case slug now. If `<home>/specs/<slug>/grill.md` exists, an earlier grill stopped: read it, tell the developer where it left off, and continue from its open items instead of asking again.
+
+## Keep notes as you go
+
+After every answer that settles something, add it to `<home>/specs/<slug>/grill.md` (sections: Decisions, Invariants, Out of scope, Open) and save: `<home>/bin/home save "grill: <slug>"`, without asking. One line per item; the chat is not a record, this file is. `/to-spec` reads it.
+
 ## How to ask
 
 - **One question per message.** Give your recommended answer and why, so they can accept it in a word.
